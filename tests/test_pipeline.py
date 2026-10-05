@@ -189,8 +189,10 @@ class TestDatabaseOperationsMocked(unittest.TestCase):
 
         executed_sqls = " ".join(call[0][0] for call in mock_cur.execute.call_args_list)
         self.assertIn("CREATE SCHEMA IF NOT EXISTS telegram", executed_sqls)
+        self.assertIn("CREATE TABLE IF NOT EXISTS telegram.file_indexed", executed_sqls)
         self.assertIn("CREATE TABLE IF NOT EXISTS telegram.file_subtrees", executed_sqls)
         self.assertIn("CREATE INDEX IF NOT EXISTS idx_file_subtrees_digest_weight", executed_sqls)
+        self.assertIn("DROP INDEX IF EXISTS telegram.idx_file_subtrees_file_sha", executed_sqls)
         mock_conn.commit.assert_called_once()
 
     @patch("db_compare.get_db_connection")
@@ -266,7 +268,16 @@ class TestDatabaseOperationsMocked(unittest.TestCase):
         populate_subtrees(args)
 
         self.assertTrue(mock_write_cur.executemany.called)
+        # Check that both file_subtrees and file_indexed insertions occurred
+        executed_sqls = " ".join(call[0][0] for call in mock_write_cur.executemany.call_args_list)
+        self.assertIn("telegram.file_subtrees", executed_sqls)
+        self.assertIn("telegram.file_indexed", executed_sqls)
         self.assertGreaterEqual(mock_conn.commit.call_count, 1)
+
+        # Check resume query uses telegram.file_indexed
+        stream_query = mock_stream_cur.execute.call_args[0][0]
+        self.assertIn("telegram.file_indexed", stream_query)
+        self.assertNotIn("withhold", str(mock_conn.cursor.call_args))
 
 
 class TestRealExampleFiles(unittest.TestCase):

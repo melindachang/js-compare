@@ -75,9 +75,21 @@ def get_db_connection() -> psycopg.Connection[Any]:
 
 
 def init_db(conn: psycopg.Connection[Any]) -> None:
-    """Ensure schema and telegram.file_subtrees destination table exist."""
+    """Ensure schema and destination tables exist."""
     with conn.cursor() as cur:
         cur.execute("CREATE SCHEMA IF NOT EXISTS telegram;")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS telegram.file_indexed (
+                file_sha TEXT PRIMARY KEY,
+                total_nodes INTEGER NOT NULL,
+                root_digest CHAR(64) NOT NULL,
+                indexed_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+            );
+        """)
+        cur.execute("""
+            CREATE INDEX IF NOT EXISTS idx_file_indexed_root
+            ON telegram.file_indexed (root_digest);
+        """)
         cur.execute("""
             CREATE TABLE IF NOT EXISTS telegram.file_subtrees (
                 file_sha TEXT NOT NULL,
@@ -94,12 +106,20 @@ def init_db(conn: psycopg.Connection[Any]) -> None:
             ON telegram.file_subtrees (digest, weight DESC);
         """)
         cur.execute("""
-            CREATE INDEX IF NOT EXISTS idx_file_subtrees_file_sha
-            ON telegram.file_subtrees (file_sha);
-        """)
-        cur.execute("""
             CREATE INDEX IF NOT EXISTS idx_file_subtrees_root
             ON telegram.file_subtrees (digest) WHERE is_root = TRUE;
+        """)
+        # Drop redundant index (PRIMARY KEY (file_sha, digest) already indexes file_sha as leading column)
+        cur.execute("""
+            DROP INDEX IF EXISTS telegram.idx_file_subtrees_file_sha;
+        """)
+        # Backfill file_indexed from existing file_subtrees if present
+        cur.execute("""
+            INSERT INTO telegram.file_indexed (file_sha, total_nodes, root_digest)
+            SELECT file_sha, weight, digest
+            FROM telegram.file_subtrees
+            WHERE is_root = TRUE
+            ON CONFLICT (file_sha) DO NOTHING;
         """)
     conn.commit()
 
@@ -175,7 +195,7 @@ def populate_subtrees(args: argparse.Namespace) -> None:
             WHERE b.level_2 = true
         """
         if args.resume:
-            query += " AND NOT EXISTS (SELECT 1 FROM telegram.file_subtrees s WHERE s.file_sha = a.sha)"
+            query += " AND NOT EXISTS (SELECT 1 FROM telegram.file_indexed s WHERE s.file_sha = a.sha)"
         if args.limit:
             query += f" LIMIT {args.limit}"
 
@@ -185,9 +205,9 @@ def populate_subtrees(args: argparse.Namespace) -> None:
         failed_files = 0
         start_time = time.time()
 
-        # Use server-side cursor on read_conn with withhold=True to stream records.
-        # Keeping read_conn separate from write_conn prevents write commits from closing the cursor.
-        with read_conn.cursor(name="file_stream", withhold=True) as stream_cur:
+        # Use streaming server-side cursor without withhold=True so PostgreSQL
+        # lazily fetches batches without materializing hundreds of thousands of files up front.
+        with read_conn.cursor(name="file_stream") as stream_cur:
             stream_cur.itersize = batch_size
             stream_cur.execute(query)
 
@@ -209,6 +229,7 @@ def populate_subtrees(args: argparse.Namespace) -> None:
                         for sha, content in rows
                     ]
 
+                    indexed_rows: list[tuple[str, int, str]] = []
                     batch_rows: list[tuple[str, str, int, str, bool, int]] = []
                     for fut in futures:
                         sha, subtrees, err = fut.result()
@@ -216,24 +237,40 @@ def populate_subtrees(args: argparse.Namespace) -> None:
                             failed_files += 1
                         else:
                             total_files += 1
+                            root_row = next((r for r in subtrees if r.is_root), None)
+                            if root_row:
+                                indexed_rows.append((sha, root_row.weight, root_row.digest))
                             for row in subtrees:
                                 batch_rows.append(
                                     (row.file_sha, row.digest, row.weight, row.label, row.is_root, row.count)
                                 )
 
-                    # Insert batch of subtrees into PostgreSQL using write_conn
-                    if batch_rows:
+                    # Insert batch of subtrees and indexed file metadata
+                    if batch_rows or indexed_rows:
                         with write_conn.cursor() as write_cur:
-                            write_cur.executemany(
-                                """
-                                INSERT INTO telegram.file_subtrees
-                                    (file_sha, digest, weight, label, is_root, count)
-                                VALUES (%s, %s, %s, %s, %s, %s)
-                                ON CONFLICT (file_sha, digest) DO UPDATE
-                                    SET count = telegram.file_subtrees.count + EXCLUDED.count
-                                """,
-                                batch_rows,
-                            )
+                            if batch_rows:
+                                write_cur.executemany(
+                                    """
+                                    INSERT INTO telegram.file_subtrees
+                                        (file_sha, digest, weight, label, is_root, count)
+                                    VALUES (%s, %s, %s, %s, %s, %s)
+                                    ON CONFLICT (file_sha, digest) DO UPDATE
+                                        SET count = telegram.file_subtrees.count + EXCLUDED.count
+                                    """,
+                                    batch_rows,
+                                )
+                            if indexed_rows:
+                                write_cur.executemany(
+                                    """
+                                    INSERT INTO telegram.file_indexed
+                                        (file_sha, total_nodes, root_digest)
+                                    VALUES (%s, %s, %s)
+                                    ON CONFLICT (file_sha) DO UPDATE
+                                        SET total_nodes = EXCLUDED.total_nodes,
+                                            root_digest = EXCLUDED.root_digest
+                                    """,
+                                    indexed_rows,
+                                )
                         write_conn.commit()
                         total_subtrees += len(batch_rows)
 
@@ -256,11 +293,11 @@ def populate_subtrees(args: argparse.Namespace) -> None:
 
 
 def show_corpus_stats(_args: argparse.Namespace) -> None:
-    """Displays useful corpus-wide statistics and figures from telegram.file_subtrees."""
+    """Displays useful corpus-wide statistics and figures from telegram.file_subtrees and telegram.file_indexed."""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
             print("=== Corpus Overview ===")
-            cur.execute("SELECT count(DISTINCT file_sha) FROM telegram.file_subtrees;")
+            cur.execute("SELECT count(*) FROM telegram.file_indexed;")
             total_files = cur.fetchone()[0]  # type: ignore[index]
             cur.execute("SELECT count(*) FROM telegram.file_subtrees;")
             total_subtrees = cur.fetchone()[0]  # type: ignore[index]
@@ -275,11 +312,10 @@ def show_corpus_stats(_args: argparse.Namespace) -> None:
 
             print("\n=== Exact Duplicate Groups (Identical Root Digest) ===")
             cur.execute("""
-                SELECT digest, count(DISTINCT file_sha) as file_count, min(weight) as nodes
-                FROM telegram.file_subtrees
-                WHERE is_root = TRUE
-                GROUP BY digest
-                HAVING count(DISTINCT file_sha) > 1
+                SELECT root_digest, count(*) as file_count, min(total_nodes) as nodes
+                FROM telegram.file_indexed
+                GROUP BY root_digest
+                HAVING count(*) > 1
                 ORDER BY file_count DESC
                 LIMIT 10;
             """)
@@ -311,12 +347,7 @@ def cluster_candidates(args: argparse.Namespace) -> None:
 
     print(f"Querying candidate file pairs with shared weight >= {min_shared}...")
     query = f"""
-        WITH file_totals AS (
-            SELECT file_sha, weight AS total_nodes
-            FROM telegram.file_subtrees
-            WHERE is_root = TRUE
-        ),
-        candidate_pairs AS (
+        WITH candidate_pairs AS (
             SELECT
                 a.file_sha AS file1,
                 b.file_sha AS file2,
@@ -335,10 +366,10 @@ def cluster_candidates(args: argparse.Namespace) -> None:
             c.shared_weight,
             t1.total_nodes AS nodes1,
             t2.total_nodes AS nodes2,
-            (2.0 * c.shared_weight / (t1.total_nodes + t2.total_nodes)) AS similarity
+            LEAST(1.0, (2.0 * c.shared_weight / (t1.total_nodes + t2.total_nodes))) AS similarity
         FROM candidate_pairs c
-        JOIN file_totals t1 ON c.file1 = t1.file_sha
-        JOIN file_totals t2 ON c.file2 = t2.file_sha
+        JOIN telegram.file_indexed t1 ON c.file1 = t1.file_sha
+        JOIN telegram.file_indexed t2 ON c.file2 = t2.file_sha
         WHERE (2.0 * c.shared_weight / (t1.total_nodes + t2.total_nodes)) >= %s
         ORDER BY similarity DESC
         LIMIT %s;
@@ -373,8 +404,8 @@ def build_parser() -> argparse.ArgumentParser:
     pop_p.add_argument(
         "--min-weight",
         type=int,
-        default=int(os.getenv("MIN_WEIGHT", "1")),
-        help="Minimum subtree node count to persist",
+        default=int(os.getenv("MIN_WEIGHT", "5")),
+        help="Minimum subtree node count to persist (default: 5; >=5 filters leaf noise)",
     )
     pop_p.add_argument("--limit", type=int, default=None, help="Limit number of source files to process")
     pop_p.add_argument("--no-resume", dest="resume", action="store_false", help="Reprocess already indexed files")
