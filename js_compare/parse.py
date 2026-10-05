@@ -41,16 +41,54 @@ _TSX_LANGUAGE = Language(tsts.language_tsx())
 _LANGUAGES: list[Language] = [_JS_LANGUAGE, _TS_LANGUAGE, _TSX_LANGUAGE]
 
 
-def _resolve_node_types(categories: list[CstNodeType]) -> set[str]:
+def _resolve_node_types(categories: list[CstNodeType | str]) -> set[str]:
     """Expand a list of high-level category names into the flat set of
     concrete CST node type strings that should be included."""
     types: set[str] = set()
     for cat in categories:
-        cat_types = CST_NODE_CATEGORIES.get(cat)
-        if cat_types is None:
-            raise ValueError(f"Unrecognised CST node category: {cat!r}")
-        types |= cat_types
+        if cat == "all":
+            types |= ALL_CST_NODE_TYPES
+        elif cat == "loose":
+            for loose_cat in ("Programs", "Functions", "Declarations", "Statements"):
+                types |= CST_NODE_CATEGORIES[loose_cat]  # type: ignore[index]
+        else:
+            cat_types = CST_NODE_CATEGORIES.get(cat)  # type: ignore[arg-type]
+            if cat_types is None:
+                raise ValueError(f"Unrecognised CST node category: {cat!r}")
+            types |= cat_types
     return types
+
+
+def source_to_graph(
+    source: bytes | str,
+    node_types: list[CstNodeType] | None = None,
+) -> DiGraph:
+    """Parse JavaScript or TypeScript source code (as bytes or str) and return
+    a networkx DiGraph whose nodes carry a ``label`` attribute.
+
+    *node_types* selects which CST node categories to include.  When
+    ``None`` (the default) all categories are included.
+
+    Raises ``ValueError`` if the source cannot be parsed by any of the
+    available tree-sitter grammars.
+    """
+    raw_source = source.encode("utf-8") if isinstance(source, str) else source
+
+    types_to_include = (
+        _resolve_node_types(node_types) if node_types else ALL_CST_NODE_TYPES
+    )
+
+    for lang in _LANGUAGES:
+        parser = Parser(lang)
+        tree = parser.parse(raw_source)
+        root = tree.root_node
+        if not root.has_error:
+            graph = DiGraph()
+            _walk(root, graph, types_to_include)
+            if len(graph) > 0:
+                return graph
+
+    raise ValueError("Unable to parse source code with any available grammar.")
 
 
 def code_to_graph(
@@ -66,23 +104,7 @@ def code_to_graph(
     Raises ``ValueError`` if the file cannot be parsed by any of the
     available tree-sitter grammars.
     """
-    source = path.read_bytes()
-
-    types_to_include = (
-        _resolve_node_types(node_types) if node_types else ALL_CST_NODE_TYPES
-    )
-
-    for lang in _LANGUAGES:
-        parser = Parser(lang)
-        tree = parser.parse(source)
-        root = tree.root_node
-        if not root.has_error:
-            graph = DiGraph()
-            _walk(root, graph, types_to_include)
-            if len(graph) > 0:
-                return graph
-
-    raise ValueError(f"Unable to parse {path} with any available grammar.")
+    return source_to_graph(path.read_bytes(), node_types)
 
 
 # ── Internal helpers ─────────────────────────────────────────────────

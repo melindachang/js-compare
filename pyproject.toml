@@ -5,6 +5,8 @@ version = "0.1.0"
 dependencies = [
     "networkx",
     "numpy",
+    "psycopg[binary]>=3.3.6",
+    "python-dotenv>=1.2.4",
     "scipy",
     "tree-sitter>=0.23.0",
     "tree-sitter-javascript>=0.23.0",
