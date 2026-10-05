@@ -209,7 +209,6 @@ def populate_subtrees(args: argparse.Namespace) -> None:
 
         # Use streaming server-side cursor without withhold=True so PostgreSQL
         # lazily fetches batches without materializing hundreds of thousands of files up front.
-        read_conn.autocommit = True
         with read_conn.cursor(name="file_stream") as stream_cur:
             stream_cur.itersize = batch_size
             stream_cur.execute(query)
