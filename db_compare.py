@@ -199,6 +199,8 @@ def populate_subtrees(args: argparse.Namespace) -> None:
         if args.limit:
             query += f" LIMIT {args.limit}"
 
+        tolerant: bool = getattr(args, "tolerant", True)
+
         print(f"Beginning file processing with {max_workers} worker processes...")
         total_files = 0
         total_subtrees = 0
@@ -207,6 +209,7 @@ def populate_subtrees(args: argparse.Namespace) -> None:
 
         # Use streaming server-side cursor without withhold=True so PostgreSQL
         # lazily fetches batches without materializing hundreds of thousands of files up front.
+        read_conn.autocommit = True
         with read_conn.cursor(name="file_stream") as stream_cur:
             stream_cur.itersize = batch_size
             stream_cur.execute(query)
@@ -225,6 +228,7 @@ def populate_subtrees(args: argparse.Namespace) -> None:
                             content,
                             node_types,
                             min_weight,
+                            tolerant,
                         )
                         for sha, content in rows
                     ]
@@ -406,6 +410,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=int(os.getenv("MIN_WEIGHT", "5")),
         help="Minimum subtree node count to persist (default: 5; >=5 filters leaf noise)",
+    )
+    pop_p.add_argument(
+        "--tolerant",
+        action=argparse.BooleanOptionalAction,
+        default=os.getenv("TOLERANT", "true").lower() in ("true", "1", "yes"),
+        help="Allow tree-sitter error recovery on syntax errors (default: True)",
     )
     pop_p.add_argument("--limit", type=int, default=None, help="Limit number of source files to process")
     pop_p.add_argument("--no-resume", dest="resume", action="store_false", help="Reprocess already indexed files")

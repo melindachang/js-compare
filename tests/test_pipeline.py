@@ -155,6 +155,7 @@ class TestCliParser(unittest.TestCase):
             "--min-weight", "5",
             "--limit", "100",
             "--no-resume",
+            "--no-tolerant",
         ])
         self.assertEqual(args.command, "populate")
         self.assertEqual(args.batch_size, 250)
@@ -163,6 +164,7 @@ class TestCliParser(unittest.TestCase):
         self.assertEqual(args.min_weight, 5)
         self.assertEqual(args.limit, 100)
         self.assertFalse(args.resume)
+        self.assertFalse(args.tolerant)
 
     def test_cli_parser_cluster(self) -> None:
         parser = build_parser()
