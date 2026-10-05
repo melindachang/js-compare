@@ -157,8 +157,8 @@ def populate_subtrees(args: argparse.Namespace) -> None:
     max_workers: int = args.workers
 
     print("Connecting to PostgreSQL database...")
-    with get_db_connection() as conn:
-        init_db(conn)
+    with get_db_connection() as read_conn, get_db_connection() as write_conn:
+        init_db(write_conn)
 
         # Base query to fetch files
         query = """
@@ -178,8 +178,9 @@ def populate_subtrees(args: argparse.Namespace) -> None:
         failed_files = 0
         start_time = time.time()
 
-        # Use server-side cursor to stream records without loading 200k files into RAM
-        with conn.cursor(name="file_stream") as stream_cur:
+        # Use server-side cursor on read_conn with withhold=True to stream records.
+        # Keeping read_conn separate from write_conn prevents write commits from closing the cursor.
+        with read_conn.cursor(name="file_stream", withhold=True) as stream_cur:
             stream_cur.itersize = batch_size
             stream_cur.execute(query)
 
@@ -213,9 +214,9 @@ def populate_subtrees(args: argparse.Namespace) -> None:
                                     (row.file_sha, row.digest, row.weight, row.label, row.is_root, row.count)
                                 )
 
-                    # Insert batch of subtrees into PostgreSQL
+                    # Insert batch of subtrees into PostgreSQL using write_conn
                     if batch_rows:
-                        with conn.cursor() as write_cur:
+                        with write_conn.cursor() as write_cur:
                             write_cur.executemany(
                                 """
                                 INSERT INTO telegram.file_subtrees
@@ -226,7 +227,7 @@ def populate_subtrees(args: argparse.Namespace) -> None:
                                 """,
                                 batch_rows,
                             )
-                        conn.commit()
+                        write_conn.commit()
                         total_subtrees += len(batch_rows)
 
                     elapsed = time.time() - start_time
