@@ -7,14 +7,13 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from js_compare.compare import compare_code
-from js_compare.consts import GRAPHML_TOOL_PATH
 from js_compare.filetype import FileType
-from js_compare.types import ast_node_types
+from js_compare.types import cst_node_types
 
 if TYPE_CHECKING:
-    from js_compare.types import AstNodeType
+    from js_compare.types import CstNodeType
 
-loose_options: list[AstNodeType] = [
+loose_options: list[CstNodeType] = [
     "Programs",
     "Functions",
     "Declarations",
@@ -23,12 +22,12 @@ loose_options: list[AstNodeType] = [
 ast_options = [
     "all",
     "loose",
-    *ast_node_types
+    *cst_node_types
 ]
 
 parser = argparse.ArgumentParser(
     prog="js-compare",
-    description="Compares JavaScript code units, based on their AST",
+    description="Compares JavaScript code units, based on their CST",
     formatter_class=argparse.ArgumentDefaultsHelpFormatter)
 parser.add_argument("-o", "--output",
     default="-",
@@ -38,21 +37,16 @@ parser.add_argument("-o", "--output",
 parser.add_argument("-t", "--types",
     choices=ast_options,
     default=["all"],
-    help="Which AST nodes to include in the code graph when comparing code "
-         "units. You can also use the special cases 'all' to "
-         "include all AST nodes, or 'loose', to include just the following "
-         "node types: " + ", ".join(loose_options),
+    help="Which CST node categories to include in the code graph when "
+         "comparing code units. You can also use the special cases 'all' to "
+         "include all node types, or 'loose', to include just the following "
+         "categories: " + ", ".join(loose_options),
     nargs="+")
-parser.add_argument("-w", "--workspace",
-    default=GRAPHML_TOOL_PATH,
-    help="Path to a directory that exists and be written to, or does not "
-         "exist and can be created. This directory will be used to create a "
-         "child program to convert JavaScript code to GraphML.",)
 parser.add_argument("file1",
     help="Path to first JavaScript code unit to compare.",
     type=Path)
 parser.add_argument("file2",
-    help="Path to first JavaScript code unit to compare.",
+    help="Path to second JavaScript code unit to compare.",
     type=Path)
 
 args = parser.parse_args()
@@ -68,16 +62,17 @@ elif "all" in args.types:
         raise argparse.ArgumentTypeError(
             "Invalid arguments for --type: Cannot use 'all' preset type "
             "along with other types.")
-    NODE_TYPES = ast_node_types
+    NODE_TYPES = cst_node_types
 else:
     NODE_TYPES = args.types
 
-result = compare_code(args.workspace, args.file1, args.file2, NODE_TYPES)
+result = compare_code(args.file1, args.file2, NODE_TYPES)
 data = {
     "code1": result.graph1,
     "code2": result.graph2,
     "overlap": result.overlap,
     "normalized": result.normalized,
+    "similarity": result.similarity,
 }
 json.dump(data, args.output)
 args.output.write("\n")

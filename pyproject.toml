@@ -1,11 +1,14 @@
 [project]
 name = "js-compare"
 readme = "README.txt"
-version = "0.0.2"
+version = "0.1.0"
 dependencies = [
     "networkx",
     "numpy",
     "scipy",
+    "tree-sitter>=0.23.0",
+    "tree-sitter-javascript>=0.23.0",
+    "tree-sitter-typescript>=0.23.0",
 ]
 
 [project.optional-dependencies]

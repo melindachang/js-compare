@@ -96,7 +96,7 @@ class ASTTree:
             self.graph = graph
             self.root = root_node
         else:
-            root_nodes = nodes_with_attr(graph, ATTR_LABEL, "Program")
+            root_nodes = nodes_with_attr(graph, ATTR_LABEL, "program")
             self.root = next(root_nodes)
             assert next(root_nodes, None) is None
             self.graph = graph.copy()
@@ -108,7 +108,7 @@ class ASTTree:
             sys.setrecursionlimit(current_recursion_limit)
 
     def copy(self) -> ASTTree:
-        return ASTTree(self.graph, self.root)
+        return ASTTree(self.graph.copy(), self.root)
 
     def attrs_for_node(self, node: _Node) -> NodeAttrs:
         return get_attrs_for_node(self.graph, node)
@@ -136,12 +136,17 @@ class ASTTree:
     def common_subtree_roots(self, tree: ASTTree) -> Generator[NodeAttrs]:
         """Return NodeAttrs that are roots of subtrees that appear in
         the current instance, and also the remote instance (uniquely)."""
+        self_copy = self.copy()
         other_tree = tree.copy()
         for node_attrs in self.nodes_sorted(ATTR_WEIGHT, True):
+            if node_attrs.node not in self_copy.graph:
+                continue
             matches = other_tree.contains(node_attrs.digest)
             if len(matches) == 0:
                 continue
             removed_node_attrs: NodeAttrs = matches[0]
-            num_removed_nodes = other_tree.remove_node(removed_node_attrs.node)
-            assert num_removed_nodes == removed_node_attrs.weight
-            yield removed_node_attrs
+            num_removed_self = self_copy.remove_node(node_attrs.node)
+            assert num_removed_self == node_attrs.weight
+            num_removed_other = other_tree.remove_node(removed_node_attrs.node)
+            assert num_removed_other == removed_node_attrs.weight
+            yield node_attrs
