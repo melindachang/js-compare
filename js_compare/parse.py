@@ -61,13 +61,17 @@ def _resolve_node_types(categories: list[CstNodeType | str]) -> set[str]:
 
 def source_to_graph(
     source: bytes | str,
-    node_types: list[CstNodeType] | None = None,
+    node_types: list[CstNodeType | str] | None = None,
+    tolerant: bool = False,
 ) -> DiGraph:
     """Parse JavaScript or TypeScript source code (as bytes or str) and return
     a networkx DiGraph whose nodes carry a ``label`` attribute.
 
     *node_types* selects which CST node categories to include.  When
     ``None`` (the default) all categories are included.
+
+    *tolerant* when True allows tree-sitter to recover from minor syntax errors
+    and construct graphs for the valid portions of the file.
 
     Raises ``ValueError`` if the source cannot be parsed by any of the
     available tree-sitter grammars.
@@ -78,11 +82,23 @@ def source_to_graph(
         _resolve_node_types(node_types) if node_types else ALL_CST_NODE_TYPES
     )
 
+    # First attempt: strict parsing (zero syntax errors)
     for lang in _LANGUAGES:
         parser = Parser(lang)
         tree = parser.parse(raw_source)
         root = tree.root_node
         if not root.has_error:
+            graph = DiGraph()
+            _walk(root, graph, types_to_include)
+            if len(graph) > 0:
+                return graph
+
+    # Second attempt (if tolerant=True): allow tree-sitter error recovery
+    if tolerant:
+        for lang in _LANGUAGES:
+            parser = Parser(lang)
+            tree = parser.parse(raw_source)
+            root = tree.root_node
             graph = DiGraph()
             _walk(root, graph, types_to_include)
             if len(graph) > 0:

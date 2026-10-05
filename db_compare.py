@@ -6,6 +6,7 @@ files from PostgreSQL using js-compare's Merkle tree algorithm.
 from __future__ import annotations
 
 import argparse
+from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
 import os
@@ -105,13 +106,19 @@ def init_db(conn: psycopg.Connection[Any]) -> None:
 
 def process_file_ast(
     file_sha: str,
-    content: bytes | str,
+    content: bytes | str | None,
     node_types: list[CstNodeType] | None,
     min_weight: int,
+    tolerant: bool = False,
 ) -> tuple[str, list[SubtreeRow], str | None]:
     """Worker function: parses source code into CST and extracts Merkle subtrees."""
+    if content is None:
+        return file_sha, [], "File content is NULL in database"
+    if (isinstance(content, str) and not content.strip()) or (isinstance(content, bytes) and not content.strip()):
+        return file_sha, [], "File content is empty or whitespace"
+
     try:
-        graph = source_to_graph(content, node_types)
+        graph = source_to_graph(content, node_types, tolerant=tolerant)
         tree = ASTTree(graph)
         root_digest = tree.attrs_for_node(tree.root).digest
 

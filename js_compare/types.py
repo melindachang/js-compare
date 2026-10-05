@@ -162,9 +162,10 @@ ALL_CST_NODE_TYPES: set[str] = set()
 for _types in CST_NODE_CATEGORIES.values():
     ALL_CST_NODE_TYPES |= _types
 
-# Node types that should never be included in the graph (comments, etc.)
+# Node types that should never be included in the graph (comments, errors, etc.)
 NEVER_TYPES: frozenset[str] = frozenset({
     "comment",
     "multiline_comment",
     "html_comment",
+    "ERROR",
 })
