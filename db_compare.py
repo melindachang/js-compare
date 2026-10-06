@@ -318,8 +318,38 @@ def show_corpus_stats(_args: argparse.Namespace) -> None:
             dup_groups = row[0] if row else 0
             total_dup_files = row[1] if row else 0
 
+            cur.execute("""
+                WITH duplicate_files AS (
+                    SELECT file_sha
+                    FROM telegram.file_indexed
+                    WHERE root_digest IN (
+                        SELECT root_digest
+                        FROM telegram.file_indexed
+                        GROUP BY root_digest
+                        HAVING count(*) > 1
+                    )
+                )
+                SELECT
+                    count(*),
+                    count(DISTINCT a.repo_id)
+                FROM telegram.githubcodeapi_file a
+                JOIN telegram.githubcodeapi_file_printed b ON a.sha = b.file_sha
+                WHERE b.level_2 = true
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM duplicate_files d
+                      WHERE d.file_sha = a.sha
+                  );
+            """)
+            corpus_row = cur.fetchone()
+            corpus_files = corpus_row[0] if corpus_row else 0
+            corpus_repos = corpus_row[1] if corpus_row else 0
+
             print(f"Total duplicate groups:               {dup_groups:,}")
-            print(f"Total unique files across all groups: {total_dup_files:,}")
+            print(
+                f"Total duplicate files: {total_dup_files:,} "
+                f"(corpus excluding duplicates: {corpus_files:,} files across {corpus_repos:,} distinct repos)"
+            )
 
             if dup_groups == 0:
                 print("No identical duplicate files found.")
