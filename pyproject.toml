@@ -16,5 +16,9 @@ dependencies = [
 [project.optional-dependencies]
 dev = [
     "mypy",
-    "pylint"
+    "pylint",
+    "pytest",
 ]
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
