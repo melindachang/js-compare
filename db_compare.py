@@ -344,11 +344,12 @@ def show_corpus_stats(_args: argparse.Namespace) -> None:
             corpus_row = cur.fetchone()
             corpus_files = corpus_row[0] if corpus_row else 0
             corpus_repos = corpus_row[1] if corpus_row else 0
+            distinct_asts = corpus_files + dup_groups
 
             print(f"Total duplicate groups:               {dup_groups:,}")
             print(
                 f"Total duplicate files: {total_dup_files:,} "
-                f"(corpus excluding duplicates: {corpus_files:,} files across {corpus_repos:,} distinct repos)"
+                f"(distinct ASTs: {distinct_asts:,} across {corpus_repos:,} distinct repos)"
             )
 
             if dup_groups == 0:
