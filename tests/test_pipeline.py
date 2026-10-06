@@ -210,6 +210,7 @@ class TestDatabaseOperationsMocked(unittest.TestCase):
             (100,),   # total_files
             (1500,),  # total_subtrees
             (400,),   # unique_digests
+            (1, 5),   # dup_groups, total_dup_files
         ]
         mock_cur.fetchall.side_effect = [
             [("digest_root_1", 5, 20)],  # duplicate roots
@@ -220,7 +221,7 @@ class TestDatabaseOperationsMocked(unittest.TestCase):
         args = parser.parse_args(["stats"])
         # Should execute queries without raising errors
         show_corpus_stats(args)
-        self.assertGreaterEqual(mock_cur.execute.call_count, 3)
+        self.assertGreaterEqual(mock_cur.execute.call_count, 4)
 
     @patch("db_compare.get_db_connection")
     def test_cluster_candidates(self, mock_get_conn: MagicMock) -> None:

@@ -1,7 +1,4 @@
 #!/usr/bin/env python3
-"""Database pipeline for extracting AST subtrees and clustering JavaScript/TypeScript
-files from PostgreSQL using js-compare's Merkle tree algorithm.
-"""
 
 from __future__ import annotations
 
@@ -25,7 +22,6 @@ from js_compare.types import cst_node_types
 if TYPE_CHECKING:
     from js_compare.types import CstNodeType
 
-# Load .env if present
 load_dotenv()
 
 LOOSE_OPTIONS: list[CstNodeType] = [
@@ -47,7 +43,6 @@ class SubtreeRow:
 
 
 def get_db_connection() -> psycopg.Connection[Any]:
-    """Establishes a connection to PostgreSQL using environment variables or ~/.pgpass."""
     conn_params: dict[str, Any] = {}
 
     if host := os.getenv("PGHOST"):
@@ -75,7 +70,6 @@ def get_db_connection() -> psycopg.Connection[Any]:
 
 
 def init_db(conn: psycopg.Connection[Any]) -> None:
-    """Ensure schema and destination tables exist."""
     with conn.cursor() as cur:
         cur.execute("CREATE SCHEMA IF NOT EXISTS telegram;")
         cur.execute("""
@@ -131,7 +125,6 @@ def process_file_ast(
     min_weight: int,
     tolerant: bool = False,
 ) -> tuple[str, list[SubtreeRow], str | None]:
-    """Worker function: parses source code into CST and extracts Merkle subtrees."""
     if content is None:
         return file_sha, [], "File content is NULL in database"
     if (isinstance(content, str) and not content.strip()) or (isinstance(content, bytes) and not content.strip()):
@@ -177,7 +170,6 @@ def resolve_node_types(type_arg: str) -> list[CstNodeType] | None:
 
 
 def populate_subtrees(args: argparse.Namespace) -> None:
-    """Streams files from database, parses AST subtrees in parallel, and saves to telegram.file_subtrees."""
     node_types = resolve_node_types(args.types)
     batch_size: int = args.batch_size
     min_weight: int = args.min_weight
@@ -296,10 +288,9 @@ def populate_subtrees(args: argparse.Namespace) -> None:
 
 
 def show_corpus_stats(_args: argparse.Namespace) -> None:
-    """Displays useful corpus-wide statistics and figures from telegram.file_subtrees and telegram.file_indexed."""
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            print("=== Corpus Overview ===")
+            print("=== Overview ===")
             cur.execute("SELECT count(*) FROM telegram.file_indexed;")
             total_files = cur.fetchone()[0]  # type: ignore[index]
             cur.execute("SELECT count(*) FROM telegram.file_subtrees;")
@@ -313,23 +304,39 @@ def show_corpus_stats(_args: argparse.Namespace) -> None:
             if total_files > 0:
                 print(f"Avg subtrees per file:   {total_subtrees / total_files:.1f}")
 
-            print("\n=== Exact Duplicate Groups (Identical Root Digest) ===")
+            print("\n=== Groups of duplicate CSTs ===")
             cur.execute("""
-                SELECT root_digest, count(*) as file_count, min(total_nodes) as nodes
-                FROM telegram.file_indexed
-                GROUP BY root_digest
-                HAVING count(*) > 1
-                ORDER BY file_count DESC
-                LIMIT 10;
+                SELECT count(*), coalesce(sum(file_count), 0)
+                FROM (
+                    SELECT count(*) as file_count
+                    FROM telegram.file_indexed
+                    GROUP BY root_digest
+                    HAVING count(*) > 1
+                ) sub;
             """)
-            dups = cur.fetchall()
-            if not dups:
+            row = cur.fetchone()
+            dup_groups = row[0] if row else 0
+            total_dup_files = row[1] if row else 0
+
+            print(f"Total duplicate groups:               {dup_groups:,}")
+            print(f"Total unique files across all groups: {total_dup_files:,}")
+
+            if dup_groups == 0:
                 print("No identical duplicate files found.")
             else:
+                cur.execute("""
+                    SELECT root_digest, count(*) as file_count, min(total_nodes) as nodes
+                    FROM telegram.file_indexed
+                    GROUP BY root_digest
+                    HAVING count(*) > 1
+                    ORDER BY file_count DESC
+                    LIMIT 10;
+                """)
+                dups = cur.fetchall()
                 for digest, count, nodes in dups:
                     print(f"Root: {digest[:16]}... | Files: {count:,} | Nodes: {nodes:,}")
 
-            print("\n=== Top Shared Subtrees (Libraries / Boilerplate) ===")
+            print("\n=== Top shared subtrees ===")
             cur.execute("""
                 SELECT digest, label, weight, count(DISTINCT file_sha) as file_count
                 FROM telegram.file_subtrees
