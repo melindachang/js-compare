@@ -6,6 +6,7 @@ import argparse
 from collections import Counter, defaultdict
 from concurrent.futures import ProcessPoolExecutor
 from dataclasses import dataclass
+import json
 import os
 from pathlib import Path
 import sys
@@ -380,51 +381,333 @@ def show_corpus_stats(_args: argparse.Namespace) -> None:
                 print(f"Digest: {digest[:16]}... | {label:<22} | Weight: {weight:>4} nodes | Files: {count:>6,}")
 
 
-def cluster_candidates(args: argparse.Namespace) -> None:
-    """Finds clusters of similar files based on shared subtrees and Sørensen-Dice similarity."""
-    min_shared = args.min_shared_weight
-    min_sim = args.min_similarity
-    limit = args.limit or 1000
+def select_cluster_representative(
+    members: set[str],
+    root_digests: dict[str, str],
+    node_counts: dict[str, int],
+    similarity_matrix: dict[tuple[str, str], float],
+) -> tuple[str, float]:
+    """Select the medoid representative of a cluster (highest avg similarity to others)."""
+    if len(members) == 1:
+        return next(iter(members)), 1.0
 
-    print(f"Querying candidate file pairs with shared weight >= {min_shared}...")
-    query = f"""
-        WITH candidate_pairs AS (
-            SELECT
-                a.file_sha AS file1,
-                b.file_sha AS file2,
-                SUM(LEAST(a.count, b.count) * a.weight) AS shared_weight
-            FROM telegram.file_subtrees a
-            JOIN telegram.file_subtrees b
-                ON a.digest = b.digest
-                AND a.file_sha < b.file_sha
-            WHERE a.weight >= %s
-            GROUP BY a.file_sha, b.file_sha
-            HAVING SUM(LEAST(a.count, b.count) * a.weight) >= %s
-        )
-        SELECT
-            c.file1,
-            c.file2,
-            c.shared_weight,
-            t1.total_nodes AS nodes1,
-            t2.total_nodes AS nodes2,
-            LEAST(1.0, (2.0 * c.shared_weight / (t1.total_nodes + t2.total_nodes))) AS similarity
-        FROM candidate_pairs c
-        JOIN telegram.file_indexed t1 ON c.file1 = t1.file_sha
-        JOIN telegram.file_indexed t2 ON c.file2 = t2.file_sha
-        WHERE (2.0 * c.shared_weight / (t1.total_nodes + t2.total_nodes)) >= %s
-        ORDER BY similarity DESC
-        LIMIT %s;
+    best_rep = ""
+    best_score: tuple[float, int, str] = (-1.0, -1, "")
+    best_avg_sim = 0.0
+
+    for u in members:
+        total_sim = 0.0
+        u_root = root_digests.get(u)
+        for v in members:
+            if u == v:
+                continue
+            if u_root and u_root == root_digests.get(v):
+                total_sim += 1.0
+            else:
+                pair_key = (min(u, v), max(u, v))
+                total_sim += similarity_matrix.get(pair_key, 0.0)
+
+        avg_sim = total_sim / (len(members) - 1)
+        score = (avg_sim, node_counts.get(u, 0), u)
+        if score > best_score:
+            best_score = score
+            best_rep = u
+            best_avg_sim = avg_sim
+
+    return best_rep, best_avg_sim
+
+
+def cluster_corpus(args: argparse.Namespace) -> None:  # pylint: disable=too-many-locals,too-many-statements,too-many-branches
+    """Cluster files by pairwise AST similarity down to a target cluster count.
+
+    Uses constrained complete-linkage agglomerative clustering to prevent chaining:
+    1. Pre-groups exact AST duplicates (same root_digest).
+    2. Merges pairs in descending similarity order only if all cross-pairs satisfy min_similarity
+       and the merged cluster size does not exceed max_cluster_size.
+    3. Selects the medoid (highest average similarity) as the representative for each cluster.
     """
+    target_clusters: int = args.target_clusters
+    min_sim: float = args.min_similarity
+    max_size: int = args.max_cluster_size
+    min_shared: int = args.min_shared_weight
+    min_weight: int = args.min_weight
+    pair_limit: int | None = args.pair_limit
+
+    start_time = time.time()
+    print("Connecting to PostgreSQL database...")
     with get_db_connection() as conn:
         with conn.cursor() as cur:
-            cur.execute(query, (args.min_weight, min_shared, min_sim, limit))
-            pairs = cur.fetchall()
+            print("Fetching indexed files from telegram.file_indexed...")
+            cur.execute("SELECT file_sha, total_nodes, root_digest FROM telegram.file_indexed;")
+            rows = cur.fetchall()
 
-            print(f"\nTop {len(pairs)} Similar Pairs (Similarity >= {min_sim:.2f}):")
-            print(f"{'File 1 SHA':<20} {'File 2 SHA':<20} {'Overlap':<10} {'Sim':<8}")
-            print("-" * 62)
-            for f1, f2, shared, n1, n2, sim in pairs:
-                print(f"{f1[:18]:<20} {f2[:18]:<20} {shared:>7} n {sim:>7.3f}")
+            if not rows:
+                print("No indexed files found in telegram.file_indexed. Run 'populate' first.")
+                return
+
+            root_digests: dict[str, str] = {}
+            node_counts: dict[str, int] = {}
+            digest_to_shas: dict[str, list[str]] = defaultdict(list)
+
+            for sha, total_nodes, root_digest in rows:
+                root_digests[sha] = root_digest
+                node_counts[sha] = total_nodes
+                digest_to_shas[root_digest].append(sha)
+
+            total_files = len(rows)
+
+            # Step 1: Pre-group exact AST duplicates (root_digest matches)
+            clusters: dict[int, set[str]] = {}
+            file_to_cluster: dict[str, int] = {}
+            cluster_id_counter = 0
+
+            for shas in digest_to_shas.values():
+                if max_size > 0 and len(shas) > max_size:
+                    for i in range(0, len(shas), max_size):
+                        chunk = set(shas[i : i + max_size])
+                        cid = cluster_id_counter
+                        cluster_id_counter += 1
+                        clusters[cid] = chunk
+                        for s in chunk:
+                            file_to_cluster[s] = cid
+                else:
+                    chunk = set(shas)
+                    cid = cluster_id_counter
+                    cluster_id_counter += 1
+                    clusters[cid] = chunk
+                    for s in chunk:
+                        file_to_cluster[s] = cid
+
+            initial_clusters = len(clusters)
+            collapsed_dups = total_files - initial_clusters
+            print(
+                f"Loaded {total_files:,} files | Pre-grouped into {initial_clusters:,} clusters "
+                f"({collapsed_dups:,} exact AST duplicates collapsed)."
+            )
+
+            if initial_clusters <= target_clusters:
+                print(
+                    f"Cluster count ({initial_clusters:,}) is already at or below target "
+                    f"({target_clusters:,}). No near-duplicate merges required."
+                )
+                pair_rows = []
+                similarity_matrix: dict[tuple[str, str], float] = {}
+            else:
+                # Step 2: Fetch candidate pairs sorted descending by similarity
+                print(
+                    f"Querying candidate pairs (min_sim >= {min_sim:.2f}, "
+                    f"shared_weight >= {min_shared}, weight >= {min_weight})..."
+                )
+                query = """
+                    WITH candidate_pairs AS (
+                        SELECT
+                            a.file_sha AS file1,
+                            b.file_sha AS file2,
+                            SUM(LEAST(a.count, b.count) * a.weight) AS shared_weight
+                        FROM telegram.file_subtrees a
+                        JOIN telegram.file_subtrees b
+                            ON a.digest = b.digest
+                            AND a.file_sha < b.file_sha
+                        WHERE a.weight >= %s
+                        GROUP BY a.file_sha, b.file_sha
+                        HAVING SUM(LEAST(a.count, b.count) * a.weight) >= %s
+                    ),
+                    ranked_pairs AS (
+                        SELECT
+                            c.file1,
+                            c.file2,
+                            c.shared_weight,
+                            t1.total_nodes AS nodes1,
+                            t2.total_nodes AS nodes2,
+                            LEAST(1.0, (2.0 * c.shared_weight / (t1.total_nodes + t2.total_nodes))) AS similarity
+                        FROM candidate_pairs c
+                        JOIN telegram.file_indexed t1 ON c.file1 = t1.file_sha
+                        JOIN telegram.file_indexed t2 ON c.file2 = t2.file_sha
+                        WHERE (2.0 * c.shared_weight / (t1.total_nodes + t2.total_nodes)) >= %s
+                        ORDER BY similarity DESC
+                """
+                if pair_limit:
+                    query += f" LIMIT {pair_limit}"
+                query += "\n) SELECT file1, file2, similarity FROM ranked_pairs;"
+
+                cur.execute(query, (min_weight, min_shared, min_sim))
+                pair_rows = cur.fetchall()
+                print(f"Retrieved {len(pair_rows):,} candidate pairs.")
+
+                # Populate edge lookup
+                similarity_matrix = {
+                    (min(f1, f2), max(f1, f2)): float(sim)
+                    for f1, f2, sim in pair_rows
+                }
+
+                # Step 3: Constrained agglomerative clustering loop
+                print(
+                    f"Running constrained complete-linkage clustering towards target {target_clusters:,} "
+                    f"(max_size={max_size or 'unlimited'}, min_sim={min_sim:.2f})..."
+                )
+                merges_performed = 0
+                rejections_size = 0
+                rejections_sim = 0
+
+                for f1, f2, _ in pair_rows:
+                    if len(clusters) <= target_clusters:
+                        print(f"\nReached target cluster count ({len(clusters):,}).")
+                        break
+
+                    c1 = file_to_cluster.get(f1)
+                    c2 = file_to_cluster.get(f2)
+                    if c1 is None or c2 is None or c1 == c2:
+                        continue
+
+                    members1 = clusters[c1]
+                    members2 = clusters[c2]
+
+                    # Constraint 2: Maximum cluster size
+                    if max_size > 0 and (len(members1) + len(members2) > max_size):
+                        rejections_size += 1
+                        continue
+
+                    # Constraint 1: Complete linkage (all cross-pairs >= min_similarity)
+                    can_merge = True
+                    for m1 in members1:
+                        for m2 in members2:
+                            if root_digests.get(m1) == root_digests.get(m2):
+                                continue
+                            pair_key = (min(m1, m2), max(m1, m2))
+                            if similarity_matrix.get(pair_key, 0.0) < min_sim:
+                                can_merge = False
+                                break
+                        if not can_merge:
+                            break
+
+                    if not can_merge:
+                        rejections_sim += 1
+                        continue
+
+                    # Merge smaller cluster into larger cluster
+                    if len(members1) < len(members2):
+                        c1, c2 = c2, c1
+                        members1, members2 = members2, members1
+
+                    members1.update(members2)
+                    for m in members2:
+                        file_to_cluster[m] = c1
+                    del clusters[c2]
+                    merges_performed += 1
+
+                print(
+                    f"\nClustering complete: {merges_performed:,} merges performed "
+                    f"(rejected: {rejections_size:,} by size cap, {rejections_sim:,} by min_similarity)."
+                )
+
+        # Step 4: Compute representatives and cluster stats
+        print("Selecting medoid representatives for each cluster...")
+        cluster_results: list[tuple[int, str, float, set[str]]] = []
+        for cid, members in clusters.items():
+            rep, avg_sim = select_cluster_representative(
+                members, root_digests, node_counts, similarity_matrix
+            )
+            cluster_results.append((cid, rep, avg_sim, members))
+
+        # Sort clusters by size descending
+        cluster_results.sort(key=lambda x: len(x[3]), reverse=True)
+
+        size_counts = Counter(len(m) for _, _, _, m in cluster_results)
+        singleton_count = size_counts.get(1, 0)
+        multi_count = len(cluster_results) - singleton_count
+
+        elapsed = time.time() - start_time
+        print("\n" + "=" * 60)
+        print("CLUSTER SUMMARY")
+        print("=" * 60)
+        print(f"Total files:              {total_files:,}")
+        print(f"Final distinct clusters:  {len(cluster_results):,} (Target: {target_clusters:,})")
+        print(f"Singletons (size 1):      {singleton_count:,}")
+        print(f"Multi-file clusters:      {multi_count:,}")
+        print(f"Largest cluster size:     {len(cluster_results[0][3]) if cluster_results else 0}")
+        print(f"Time elapsed:             {elapsed:.1f}s")
+
+        print("\nCluster Size Distribution:")
+        print(f"  Size 1:      {size_counts.get(1, 0):>6,}")
+        print(f"  Size 2:      {size_counts.get(2, 0):>6,}")
+        print(f"  Size 3 - 5:  {sum(c for s, c in size_counts.items() if 3 <= s <= 5):>6,}")
+        print(f"  Size 6 - 10: {sum(c for s, c in size_counts.items() if 6 <= s <= 10):>6,}")
+        print(f"  Size 11+:    {sum(c for s, c in size_counts.items() if s >= 11):>6,}")
+
+        print("\nTop 10 Largest Clusters:")
+        print(f"{'Cluster':<9} {'Size':<6} {'Avg Sim':<9} {'Representative SHA':<20} {'Sample Members'}")
+        print("-" * 80)
+        for i, (cid, rep, avg_sim, members) in enumerate(cluster_results[:10], 1):
+            sample_members = ", ".join(m[:8] for m in list(members) if m != rep)[:35]
+            if len(members) > 1 and not sample_members:
+                sample_members = "(duplicates)"
+            print(f"#{i:<8} {len(members):<6} {avg_sim:<9.3f} {rep[:18]:<20} {sample_members}")
+
+        # Step 5: Save to database if requested
+        if args.save_to_db:
+            print("\nSaving cluster assignments into telegram.file_clusters...")
+            with get_db_connection() as write_conn:
+                with write_conn.cursor() as cur:
+                    cur.execute("""
+                        CREATE TABLE IF NOT EXISTS telegram.file_clusters (
+                            cluster_id INTEGER NOT NULL,
+                            file_sha TEXT NOT NULL PRIMARY KEY,
+                            representative_sha TEXT NOT NULL,
+                            is_representative BOOLEAN NOT NULL DEFAULT FALSE,
+                            cluster_size INTEGER NOT NULL,
+                            avg_similarity_to_rep REAL
+                        );
+                        CREATE INDEX IF NOT EXISTS idx_file_clusters_rep
+                        ON telegram.file_clusters (representative_sha);
+                        TRUNCATE TABLE telegram.file_clusters;
+                    """)
+                    insert_rows = []
+                    for cid_norm, (_, rep, _, members) in enumerate(cluster_results):
+                        c_size = len(members)
+                        for m in members:
+                            is_rep = (m == rep)
+                            if is_rep:
+                                sim_to_rep = 1.0
+                            elif root_digests.get(m) == root_digests.get(rep):
+                                sim_to_rep = 1.0
+                            else:
+                                sim_to_rep = similarity_matrix.get((min(m, rep), max(m, rep)), 0.0)
+                            insert_rows.append((cid_norm, m, rep, is_rep, c_size, sim_to_rep))
+
+                    cur.executemany("""
+                        INSERT INTO telegram.file_clusters
+                            (cluster_id, file_sha, representative_sha, is_representative, cluster_size, avg_similarity_to_rep)
+                        VALUES (%s, %s, %s, %s, %s, %s);
+                    """, insert_rows)
+                write_conn.commit()
+            print(f"Saved {len(insert_rows):,} cluster assignments into telegram.file_clusters.")
+
+        # Step 6: Export to JSON if requested
+        if args.output:
+            export_data = {
+                "summary": {
+                    "total_files": total_files,
+                    "final_distinct_clusters": len(cluster_results),
+                    "target_clusters": target_clusters,
+                    "min_similarity": min_sim,
+                    "max_cluster_size": max_size,
+                    "singletons": singleton_count,
+                    "multi_file_clusters": multi_count,
+                },
+                "clusters": [
+                    {
+                        "cluster_id": cid_norm,
+                        "representative": rep,
+                        "cluster_size": len(members),
+                        "avg_similarity": round(avg_sim, 4),
+                        "members": sorted(list(members)),
+                    }
+                    for cid_norm, (_, rep, avg_sim, members) in enumerate(cluster_results)
+                ],
+            }
+            args.output.parent.mkdir(parents=True, exist_ok=True)
+            args.output.write_text(json.dumps(export_data, indent=2), encoding="utf-8")
+            print(f"Exported cluster results to: {args.output.resolve()}")
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -462,11 +745,58 @@ def build_parser() -> argparse.ArgumentParser:
     subparsers.add_parser("stats", help="Show corpus figures and statistics.")
 
     # Subcommand: cluster
-    clust_p = subparsers.add_parser("cluster", help="Compute file similarity clusters.")
-    clust_p.add_argument("--min-similarity", type=float, default=0.7, help="Minimum Sørensen-Dice similarity (0-1)")
-    clust_p.add_argument("--min-shared-weight", type=int, default=20, help="Minimum shared node weight for pairs")
-    clust_p.add_argument("--min-weight", type=int, default=5, help="Subtree weight threshold for candidate matching")
-    clust_p.add_argument("--limit", type=int, default=500, help="Max candidate pairs to display")
+    clust_p = subparsers.add_parser(
+        "cluster",
+        help="Perform constrained agglomerative clustering to reduce files down to target cluster budget.",
+        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+    )
+    clust_p.add_argument(
+        "--target-clusters",
+        type=int,
+        default=int(os.getenv("TARGET_CLUSTERS", "30000")),
+        help="Target number of distinct clusters to stop merging at",
+    )
+    clust_p.add_argument(
+        "--min-similarity",
+        type=float,
+        default=float(os.getenv("MIN_SIMILARITY", "0.90")),
+        help="Minimum pairwise similarity required across ALL cluster members (prevents chaining)",
+    )
+    clust_p.add_argument(
+        "--max-cluster-size",
+        type=int,
+        default=int(os.getenv("MAX_CLUSTER_SIZE", "20")),
+        help="Maximum files allowed in a single cluster (0 for unlimited)",
+    )
+    clust_p.add_argument(
+        "--min-shared-weight",
+        type=int,
+        default=int(os.getenv("MIN_SHARED_WEIGHT", "20")),
+        help="Minimum shared node weight for candidate pairs",
+    )
+    clust_p.add_argument(
+        "--min-weight",
+        type=int,
+        default=int(os.getenv("MIN_WEIGHT", "5")),
+        help="Subtree weight threshold for candidate matching",
+    )
+    clust_p.add_argument(
+        "--pair-limit",
+        type=int,
+        default=None,
+        help="Optional limit on candidate pairs retrieved from database",
+    )
+    clust_p.add_argument(
+        "--output",
+        type=Path,
+        default=None,
+        help="Optional file path to export clusters (JSON format)",
+    )
+    clust_p.add_argument(
+        "--save-to-db",
+        action="store_true",
+        help="Save cluster assignments and representatives into telegram.file_clusters table",
+    )
 
     return parser
 
@@ -481,7 +811,7 @@ def main() -> None:
     elif command == "stats":
         show_corpus_stats(args)
     elif command == "cluster":
-        cluster_candidates(args)
+        cluster_corpus(args)
     else:
         parser.print_help()
 

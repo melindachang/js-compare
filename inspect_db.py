@@ -12,6 +12,8 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import threading
+import time
 from typing import Any
 
 from dotenv import load_dotenv
@@ -24,6 +26,7 @@ load_dotenv()
 COLOR_RED = "\033[31m"
 COLOR_GREEN = "\033[32m"
 COLOR_CYAN = "\033[36m"
+COLOR_YELLOW = "\033[33m"
 COLOR_BOLD = "\033[1m"
 COLOR_RESET = "\033[0m"
 
@@ -40,6 +43,37 @@ class PairCandidate:  # pylint: disable=too-many-instance-attributes
     content2: str
 
 
+class QueryTimer:
+    """Live background status ticker while database queries are executing."""
+
+    def __init__(self, message: str = "Executing query in database"):
+        self.message = message
+        self.start_time = time.time()
+        self.stop_event = threading.Event()
+        self.thread: threading.Thread | None = None
+
+    def _tick(self) -> None:
+        while not self.stop_event.wait(1.0):
+            elapsed = time.time() - self.start_time
+            sys.stderr.write(f"\r{COLOR_CYAN}[{self.message}... {elapsed:.1f}s elapsed]{COLOR_RESET} ")
+            sys.stderr.flush()
+
+    def __enter__(self) -> "QueryTimer":
+        self.start_time = time.time()
+        self.thread = threading.Thread(target=self._tick, daemon=True)
+        self.thread.start()
+        return self
+
+    def __exit__(self, exc_type: Any, exc_val: Any, exc_tb: Any) -> None:
+        self.stop_event.set()
+        if self.thread:
+            self.thread.join(timeout=0.5)
+        elapsed = time.time() - self.start_time
+        # Clear the ticker line
+        sys.stderr.write(f"\r\033[K{COLOR_GREEN}[Completed in {elapsed:.2f}s]{COLOR_RESET}\n")
+        sys.stderr.flush()
+
+
 def decode_content(content: bytes | str | memoryview | None) -> str:
     """Safely decode PostgreSQL content into a UTF-8 string."""
     if content is None:
@@ -51,10 +85,37 @@ def decode_content(content: bytes | str | memoryview | None) -> str:
     return str(content)
 
 
-def build_candidate_query() -> str:
-    """Return SQL query to retrieve candidate file pairs and their contents."""
-    return """
-        WITH candidate_pairs AS (
+def build_candidate_query(sample_files: int | None = None, max_digest_freq: int | None = None) -> tuple[str, list[Any]]:
+    """Return SQL query to retrieve candidate file pairs and their contents with optional filters."""
+    params: list[Any] = []
+
+    # If sampling files to avoid joining the entire database
+    sample_cte = ""
+    file_join = ""
+    if sample_files and sample_files > 0:
+        sample_cte = """
+            sampled_files AS (
+                SELECT file_sha FROM telegram.file_indexed LIMIT %s
+            ),
+        """
+        file_join = """
+            JOIN sampled_files sf1 ON a.file_sha = sf1.file_sha
+            JOIN sampled_files sf2 ON b.file_sha = sf2.file_sha
+        """
+        params.append(sample_files)
+
+    freq_filter = ""
+    if max_digest_freq and max_digest_freq > 0:
+        freq_filter = """
+            AND a.digest NOT IN (
+                SELECT digest FROM telegram.file_subtrees
+                GROUP BY digest HAVING count(DISTINCT file_sha) > %s
+            )
+        """
+
+    query = f"""
+        WITH {sample_cte}
+        candidate_pairs AS (
             SELECT
                 a.file_sha AS file1,
                 b.file_sha AS file2,
@@ -63,7 +124,10 @@ def build_candidate_query() -> str:
             JOIN telegram.file_subtrees b
                 ON a.digest = b.digest
                 AND a.file_sha < b.file_sha
+            {file_join}
             WHERE a.weight >= %s
+              AND b.weight >= %s
+              {freq_filter}
             GROUP BY a.file_sha, b.file_sha
             HAVING SUM(LEAST(a.count, b.count) * a.weight) >= %s
         ),
@@ -96,9 +160,9 @@ def build_candidate_query() -> str:
         JOIN telegram.githubcodeapi_file f1 ON r.file1 = f1.sha
         JOIN telegram.githubcodeapi_file f2 ON r.file2 = f2.sha;
     """
+    return query, params
 
 
-# pylint: disable=too-many-positional-arguments,too-many-locals
 def fetch_candidate_pairs(
     conn: Any,
     min_sim: float,
@@ -106,12 +170,77 @@ def fetch_candidate_pairs(
     min_weight: int,
     min_shared: int,
     limit: int,
+    sample_files: int | None = None,
+    max_digest_freq: int | None = None,
+    timeout: int = 45,
+    verbose: bool = False,
 ) -> list[PairCandidate]:
-    """Execute candidate query and return candidate pair models."""
-    query = build_candidate_query()
+    """Execute candidate query with timing, timeout guard, and progress logging."""
+    # Fast path for exact 1.0 clones if min_similarity == 1.0
+    if min_sim >= 0.9999 and max_sim >= 1.0:
+        if verbose:
+            print("[Verbose] Using fast indexed query on root_digest for exact 1.0 clones...")
+        exact_query = """
+            WITH exact_pairs AS (
+                SELECT
+                    a.file_sha AS file1,
+                    b.file_sha AS file2,
+                    1.0::float AS similarity,
+                    a.total_nodes AS shared_weight,
+                    a.total_nodes AS nodes1,
+                    b.total_nodes AS nodes2
+                FROM telegram.file_indexed a
+                JOIN telegram.file_indexed b
+                    ON a.root_digest = b.root_digest
+                    AND a.file_sha < b.file_sha
+                LIMIT %s
+            )
+            SELECT
+                p.file1, p.file2, p.similarity, p.shared_weight, p.nodes1, p.nodes2,
+                f1.content AS content1,
+                f2.content AS content2
+            FROM exact_pairs p
+            JOIN telegram.githubcodeapi_file f1 ON p.file1 = f1.sha
+            JOIN telegram.githubcodeapi_file f2 ON p.file2 = f2.sha;
+        """
+        with conn.cursor() as cur:
+            cur.execute(exact_query, (limit,))
+            rows = cur.fetchall()
+            return [
+                PairCandidate(
+                    file1_sha=f1,
+                    file2_sha=f2,
+                    similarity=float(sim),
+                    shared_weight=int(shared),
+                    nodes1=int(n1),
+                    nodes2=int(n2),
+                    content1=decode_content(c1),
+                    content2=decode_content(c2),
+                )
+                for f1, f2, sim, shared, n1, n2, c1, c2 in rows
+            ]
+
+    query, base_params = build_candidate_query(sample_files=sample_files, max_digest_freq=max_digest_freq)
+    params = list(base_params) + [min_weight, min_weight]
+    if max_digest_freq and max_digest_freq > 0:
+        params.append(max_digest_freq)
+    params.extend([min_shared, min_sim, max_sim, limit])
+
     with conn.cursor() as cur:
-        cur.execute(query, (min_weight, min_shared, min_sim, max_sim, limit))
-        rows = cur.fetchall()
+        if timeout > 0:
+            if verbose:
+                print(f"[Verbose] Setting statement_timeout to {timeout}s")
+            cur.execute(f"SET statement_timeout = {int(timeout * 1000)};")
+
+        if verbose:
+            print(f"[Verbose] Executing query with parameters: {params}")
+
+        with QueryTimer("Scanning PostgreSQL for candidate pairs"):
+            cur.execute(query, params)
+            rows = cur.fetchall()
+
+    if verbose:
+        print(f"[Verbose] Retrieved {len(rows)} matching pair record(s).")
 
     candidates: list[PairCandidate] = []
     for f1, f2, sim, shared, n1, n2, c1, c2 in rows:
@@ -128,6 +257,59 @@ def fetch_candidate_pairs(
             )
         )
     return candidates
+
+
+def run_diagnostics(conn: Any, args: argparse.Namespace) -> None:
+    """Print performance diagnosis of candidate pair matching."""
+    print(f"\n{COLOR_BOLD}=== Candidate Query Performance Diagnostics ==={COLOR_RESET}")
+    with conn.cursor() as cur:
+        # Check table sizes
+        cur.execute("SELECT count(*) FROM telegram.file_indexed;")
+        total_files = cur.fetchone()[0]
+        cur.execute("SELECT count(*) FROM telegram.file_subtrees;")
+        total_subtrees = cur.fetchone()[0]
+        cur.execute("SELECT count(DISTINCT digest) FROM telegram.file_subtrees;")
+        unique_digests = cur.fetchone()[0]
+
+        print(f"Total files indexed:     {total_files:,}")
+        print(f"Total subtree rows:      {total_subtrees:,}")
+        print(f"Unique subtree digests:   {unique_digests:,}")
+
+        # Check for ubiquitous subtrees (the hub/combinatorial explosion problem)
+        print(f"\n{COLOR_YELLOW}Top 10 Most Common Subtrees (weight >= {args.min_weight}):{COLOR_RESET}")
+        print(f"Subtrees appearing in hundreds of files cause O(N^2) join row explosions.")
+        cur.execute("""
+            SELECT digest, label, weight, count(DISTINCT file_sha) AS file_count
+            FROM telegram.file_subtrees
+            WHERE weight >= %s
+            GROUP BY digest, label, weight
+            ORDER BY file_count DESC
+            LIMIT 10;
+        """, (args.min_weight,))
+        rows = cur.fetchall()
+
+        print(f"{'Digest':<18} {'Label':<24} {'Weight':<8} {'Files':<8} {'Join Combinations':<18}")
+        print("-" * 80)
+        total_potential_combos = 0
+        for d, l, w, cnt in rows:
+            combos = cnt * (cnt - 1) // 2
+            total_potential_combos += combos
+            print(f"{d[:16]:<18} {l[:22]:<24} {w:<8} {cnt:<8,} ~{combos:<18,}")
+        print("-" * 80)
+        print(f"Just these top 10 subtrees alone generate ~{total_potential_combos:,} intermediate join rows!")
+
+        # Run EXPLAIN on the candidate query
+        print(f"\n{COLOR_BOLD}PostgreSQL Query Execution Plan (EXPLAIN):{COLOR_RESET}")
+        query, base_params = build_candidate_query(sample_files=args.sample_files, max_digest_freq=args.max_digest_freq)
+        params = list(base_params) + [args.min_weight, args.min_weight]
+        if args.max_digest_freq and args.max_digest_freq > 0:
+            params.append(args.max_digest_freq)
+        params.extend([args.min_shared_weight, args.min_similarity, args.max_similarity, args.limit])
+
+        cur.execute("EXPLAIN " + query, params)
+        plan_lines = cur.fetchall()
+        for (line,) in plan_lines:
+            print(f"  {line}")
 
 
 def colorized_diff(
@@ -318,12 +500,20 @@ def interactive_loop(pairs: list[PairCandidate], custom_diff_tool: str | None = 
 
 def handle_pairs_command(args: argparse.Namespace) -> None:
     """Handle the 'pairs' subcommand execution."""
-    print(
-        f"Connecting to database and querying pairs with similarity in "
-        f"[{args.min_similarity:.4f}, {args.max_similarity:.4f}] (limit {args.limit})..."
-    )
+    if args.verbose:
+        print(f"[Verbose] Connecting to PostgreSQL database...")
+
     try:
         with get_db_connection() as conn:
+            if args.diagnose or args.explain:
+                run_diagnostics(conn, args)
+                return
+
+            print(
+                f"Querying candidate pairs in similarity window "
+                f"[{args.min_similarity:.4f}, {args.max_similarity:.4f}] "
+                f"(min_weight: {args.min_weight}, min_shared: {args.min_shared_weight}, limit: {args.limit})..."
+            )
             pairs = fetch_candidate_pairs(
                 conn,
                 min_sim=args.min_similarity,
@@ -331,9 +521,26 @@ def handle_pairs_command(args: argparse.Namespace) -> None:
                 min_weight=args.min_weight,
                 min_shared=args.min_shared_weight,
                 limit=args.limit,
+                sample_files=args.sample_files,
+                max_digest_freq=args.max_digest_freq,
+                timeout=args.timeout,
+                verbose=args.verbose,
             )
     except Exception as exc:  # pylint: disable=broad-except
-        print(f"Database error: {exc}", file=sys.stderr)
+        err_msg = str(exc)
+        print(f"\n{COLOR_RED}Database query error: {err_msg}{COLOR_RESET}", file=sys.stderr)
+        if "canceling statement due to statement timeout" in err_msg or "timeout" in err_msg:
+            print(f"\n{COLOR_YELLOW}[Diagnosis & Suggested Fixes]{COLOR_RESET}")
+            print("The self-join on telegram.file_subtrees timed out. This occurs when common subtrees")
+            print("create a massive combinatorial explosion of pair comparisons across the database.")
+            print("\nRecommended solutions:")
+            print(f"  1. Use --sample-files (e.g. --sample-files 2000):")
+            print("     Restricts candidate search to a random/initial slice of files, running in seconds.")
+            print(f"  2. Increase --min-weight (e.g. --min-weight 10 or 15):")
+            print("     Filters out tiny 5-node subtrees (common 1-line statements) that cause millions of joins.")
+            print(f"  3. Increase --min-shared-weight (e.g. --min-shared-weight 50).")
+            print(f"  4. Run with --diagnose or --explain to inspect query plan and common subtrees:")
+            print("     ./inspect_db.py pairs --diagnose")
         sys.exit(1)
 
     if not pairs:
@@ -387,6 +594,12 @@ def build_parser() -> argparse.ArgumentParser:
         description="Database inspection and analysis suite for CST/AST code similarity.",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
+    parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable detailed progress logging, execution times, and query inspection",
+    )
     subparsers = parser.add_subparsers(dest="command", required=True, help="Available subcommands")
 
     # Subcommand: pairs
@@ -417,13 +630,43 @@ def build_parser() -> argparse.ArgumentParser:
         "--min-weight",
         type=int,
         default=5,
-        help="Minimum subtree node weight threshold",
+        help="Minimum subtree node weight threshold (increase to 10+ to avoid boilerplate noise)",
     )
     pairs_parser.add_argument(
         "--limit",
         type=int,
         default=50,
         help="Maximum candidate pairs to retrieve",
+    )
+    pairs_parser.add_argument(
+        "--sample-files",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Accelerate search by sampling an initial N files (e.g. 2000) instead of joining the entire DB",
+    )
+    pairs_parser.add_argument(
+        "--max-digest-freq",
+        type=int,
+        default=None,
+        metavar="N",
+        help="Exclude subtrees shared across more than N files (filters out common boilerplate hub nodes)",
+    )
+    pairs_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=45,
+        help="PostgreSQL query statement timeout in seconds (0 to disable)",
+    )
+    pairs_parser.add_argument(
+        "--diagnose",
+        action="store_true",
+        help="Run database diagnostics: table sizes, top common subtrees, and query plan (EXPLAIN)",
+    )
+    pairs_parser.add_argument(
+        "--explain",
+        action="store_true",
+        help="Alias for --diagnose",
     )
     pairs_parser.add_argument(
         "--export-all",
@@ -449,6 +692,12 @@ def build_parser() -> argparse.ArgumentParser:
         type=str,
         default=None,
         help="Custom diff command template (e.g. 'code --diff {file1} {file2}')",
+    )
+    pairs_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable detailed progress logging, execution times, and query inspection",
     )
 
     return parser
