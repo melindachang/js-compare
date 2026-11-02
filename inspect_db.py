@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 from dataclasses import dataclass
 import difflib
 import os
@@ -44,16 +45,16 @@ class PairCandidate:  # pylint: disable=too-many-instance-attributes
 
 
 class QueryTimer:
-    """Live background status ticker while database queries are executing."""
+    """Live background status ticker while database queries or operations are executing."""
 
-    def __init__(self, message: str = "Executing query in database"):
+    def __init__(self, message: str = "Scanning database"):
         self.message = message
         self.start_time = time.time()
         self.stop_event = threading.Event()
         self.thread: threading.Thread | None = None
 
     def _tick(self) -> None:
-        while not self.stop_event.wait(1.0):
+        while not self.stop_event.wait(0.5):
             elapsed = time.time() - self.start_time
             sys.stderr.write(f"\r{COLOR_CYAN}[{self.message}... {elapsed:.1f}s elapsed]{COLOR_RESET} ")
             sys.stderr.flush()
@@ -69,7 +70,6 @@ class QueryTimer:
         if self.thread:
             self.thread.join(timeout=0.5)
         elapsed = time.time() - self.start_time
-        # Clear the ticker line
         sys.stderr.write(f"\r\033[K{COLOR_GREEN}[Completed in {elapsed:.2f}s]{COLOR_RESET}\n")
         sys.stderr.flush()
 
@@ -86,24 +86,68 @@ def decode_content(content: bytes | str | memoryview | None) -> str:
 
 
 def build_candidate_query(sample_files: int | None = None, max_digest_freq: int | None = None) -> tuple[str, list[Any]]:
-    """Return SQL query to retrieve candidate file pairs and their contents with optional filters."""
+    """Return SQL query to retrieve candidate file pairs with proper CTE scoping."""
     params: list[Any] = []
 
-    # If sampling files to avoid joining the entire database
-    sample_cte = ""
-    file_join = ""
     if sample_files and sample_files > 0:
-        sample_cte = """
-            sampled_files AS (
-                SELECT file_sha FROM telegram.file_indexed LIMIT %s
+        # Strictly scope active_subtrees to the sampled files only
+        query = """
+            WITH active_files AS (
+                SELECT file_sha, total_nodes
+                FROM telegram.file_indexed
+                LIMIT %s
             ),
+            active_subtrees AS (
+                SELECT s.file_sha, s.digest, s.weight, s.count
+                FROM telegram.file_subtrees s
+                JOIN active_files af ON s.file_sha = af.file_sha
+                WHERE s.weight >= %s
+            ),
+            candidate_pairs AS (
+                SELECT
+                    a.file_sha AS file1,
+                    b.file_sha AS file2,
+                    SUM(LEAST(a.count, b.count) * a.weight) AS shared_weight
+                FROM active_subtrees a
+                JOIN active_subtrees b
+                    ON a.digest = b.digest
+                    AND a.file_sha < b.file_sha
+                GROUP BY a.file_sha, b.file_sha
+                HAVING SUM(LEAST(a.count, b.count) * a.weight) >= %s
+            ),
+            ranked_pairs AS (
+                SELECT
+                    c.file1,
+                    c.file2,
+                    c.shared_weight,
+                    t1.total_nodes AS nodes1,
+                    t2.total_nodes AS nodes2,
+                    LEAST(1.0, (2.0 * c.shared_weight / (t1.total_nodes + t2.total_nodes))) AS similarity
+                FROM candidate_pairs c
+                JOIN active_files t1 ON c.file1 = t1.file_sha
+                JOIN active_files t2 ON c.file2 = t2.file_sha
+                WHERE (2.0 * c.shared_weight / (t1.total_nodes + t2.total_nodes)) >= %s
+                  AND (2.0 * c.shared_weight / (t1.total_nodes + t2.total_nodes)) <= %s
+                ORDER BY similarity DESC
+                LIMIT %s
+            )
+            SELECT
+                r.file1,
+                r.file2,
+                r.similarity,
+                r.shared_weight,
+                r.nodes1,
+                r.nodes2,
+                f1.content AS content1,
+                f2.content AS content2
+            FROM ranked_pairs r
+            JOIN telegram.githubcodeapi_file f1 ON r.file1 = f1.sha
+            JOIN telegram.githubcodeapi_file f2 ON r.file2 = f2.sha;
         """
-        file_join = """
-            JOIN sampled_files sf1 ON a.file_sha = sf1.file_sha
-            JOIN sampled_files sf2 ON b.file_sha = sf2.file_sha
-        """
-        params.append(sample_files)
+        params.extend([sample_files, params])  # placeholders filled in caller
+        return query, [sample_files]
 
+    # Full database search
     freq_filter = ""
     if max_digest_freq and max_digest_freq > 0:
         freq_filter = """
@@ -114,8 +158,7 @@ def build_candidate_query(sample_files: int | None = None, max_digest_freq: int 
         """
 
     query = f"""
-        WITH {sample_cte}
-        candidate_pairs AS (
+        WITH candidate_pairs AS (
             SELECT
                 a.file_sha AS file1,
                 b.file_sha AS file2,
@@ -124,7 +167,6 @@ def build_candidate_query(sample_files: int | None = None, max_digest_freq: int 
             JOIN telegram.file_subtrees b
                 ON a.digest = b.digest
                 AND a.file_sha < b.file_sha
-            {file_join}
             WHERE a.weight >= %s
               AND b.weight >= %s
               {freq_filter}
@@ -163,6 +205,140 @@ def build_candidate_query(sample_files: int | None = None, max_digest_freq: int 
     return query, params
 
 
+def fetch_candidate_pairs_in_memory(
+    conn: Any,
+    min_sim: float,
+    max_sim: float,
+    min_weight: int,
+    min_shared: int,
+    limit: int,
+    sample_files: int | None = None,
+    max_digest_freq: int | None = 200,
+    verbose: bool = False,
+) -> list[PairCandidate]:
+    """Blazing fast in-memory candidate matching using an inverted index on subtrees.
+
+    Bypasses costly PostgreSQL cross-joins by pulling subtrees directly into memory,
+    eliminating database timeouts and disk spills.
+    """
+    with conn.cursor() as cur:
+        if verbose:
+            print("[Verbose] Streaming subtree records from PostgreSQL into memory...")
+
+        with QueryTimer("Fetching subtrees from PostgreSQL"):
+            if sample_files and sample_files > 0:
+                cur.execute(
+                    """
+                    SELECT s.file_sha, s.digest, s.weight, s.count, af.total_nodes
+                    FROM (SELECT file_sha, total_nodes FROM telegram.file_indexed LIMIT %s) af
+                    JOIN telegram.file_subtrees s ON af.file_sha = s.file_sha
+                    WHERE s.weight >= %s;
+                    """,
+                    (sample_files, min_weight),
+                )
+            else:
+                cur.execute(
+                    """
+                    SELECT s.file_sha, s.digest, s.weight, s.count, fi.total_nodes
+                    FROM telegram.file_subtrees s
+                    JOIN telegram.file_indexed fi ON s.file_sha = fi.file_sha
+                    WHERE s.weight >= %s;
+                    """,
+                    (min_weight,),
+                )
+            rows = cur.fetchall()
+
+    if not rows:
+        return []
+
+    if verbose:
+        print(f"[Verbose] Fetched {len(rows):,} subtree occurrences. Building inverted index...")
+
+    # Inverted index: digest -> list of (file_sha, count, weight)
+    inverted: dict[str, list[tuple[str, int, int]]] = defaultdict(list)
+    node_counts: dict[str, int] = {}
+    for sha, digest, weight, count, total_nodes in rows:
+        inverted[digest].append((sha, count, weight))
+        node_counts[sha] = total_nodes
+
+    # Accumulate pairwise shared weight
+    pair_shared: dict[tuple[str, str], int] = defaultdict(int)
+    max_freq = max_digest_freq if max_digest_freq and max_digest_freq > 0 else 250
+    skipped_boilerplate_digests = 0
+
+    with QueryTimer("Matching pairs in memory"):
+        for _, occurrences in inverted.items():
+            if len(occurrences) > max_freq:
+                skipped_boilerplate_digests += 1
+                continue
+            n_occ = len(occurrences)
+            for i in range(n_occ):
+                f1, c1, w = occurrences[i]
+                for j in range(i + 1, n_occ):
+                    f2, c2, _ = occurrences[j]
+                    if f1 == f2:
+                        continue
+                    pair_key = (f1, f2) if f1 < f2 else (f2, f1)
+                    pair_shared[pair_key] += min(c1, c2) * w
+
+    if verbose:
+        print(
+            f"[Verbose] Found {len(pair_shared):,} overlapping file pair(s) "
+            f"(filtered {skipped_boilerplate_digests:,} common boilerplate digests)."
+        )
+
+    # Compute Sørensen-Dice similarity and filter
+    ranked: list[tuple[str, str, float, int, int, int]] = []
+    for (f1, f2), shared in pair_shared.items():
+        if shared < min_shared:
+            continue
+        n1 = node_counts.get(f1, 0)
+        n2 = node_counts.get(f2, 0)
+        if n1 + n2 == 0:
+            continue
+        sim = min(1.0, (2.0 * shared) / (n1 + n2))
+        if min_sim <= sim <= max_sim:
+            ranked.append((f1, f2, sim, shared, n1, n2))
+
+    ranked.sort(key=lambda x: x[2], reverse=True)
+    top_pairs = ranked[:limit]
+
+    if not top_pairs:
+        return []
+
+    if verbose:
+        print(f"[Verbose] Fetching source code for top {len(top_pairs)} candidate pair(s)...")
+
+    # Fetch source content for the selected pairs
+    all_needed_shas = set()
+    for f1, f2, _, _, _, _ in top_pairs:
+        all_needed_shas.add(f1)
+        all_needed_shas.add(f2)
+
+    with conn.cursor() as cur:
+        cur.execute(
+            "SELECT sha, content FROM telegram.githubcodeapi_file WHERE sha = ANY(%s);",
+            (list(all_needed_shas),),
+        )
+        contents = {sha: decode_content(content) for sha, content in cur.fetchall()}
+
+    candidates: list[PairCandidate] = []
+    for f1, f2, sim, shared, n1, n2 in top_pairs:
+        candidates.append(
+            PairCandidate(
+                file1_sha=f1,
+                file2_sha=f2,
+                similarity=float(sim),
+                shared_weight=int(shared),
+                nodes1=int(n1),
+                nodes2=int(n2),
+                content1=contents.get(f1, ""),
+                content2=contents.get(f2, ""),
+            )
+        )
+    return candidates
+
+
 def fetch_candidate_pairs(
     conn: Any,
     min_sim: float,
@@ -173,10 +349,11 @@ def fetch_candidate_pairs(
     sample_files: int | None = None,
     max_digest_freq: int | None = None,
     timeout: int = 45,
+    engine: str = "auto",
     verbose: bool = False,
 ) -> list[PairCandidate]:
     """Execute candidate query with timing, timeout guard, and progress logging."""
-    # Fast path for exact 1.0 clones if min_similarity == 1.0
+    # Fast path for exact 1.0 clones
     if min_sim >= 0.9999 and max_sim >= 1.0:
         if verbose:
             print("[Verbose] Using fast indexed query on root_digest for exact 1.0 clones...")
@@ -220,11 +397,31 @@ def fetch_candidate_pairs(
                 for f1, f2, sim, shared, n1, n2, c1, c2 in rows
             ]
 
+    # Use fast in-memory inverted index when sampling or when engine is memory/auto
+    if engine in ("memory", "auto"):
+        if verbose:
+            print("[Verbose] Using fast in-memory inverted index engine...")
+        return fetch_candidate_pairs_in_memory(
+            conn,
+            min_sim=min_sim,
+            max_sim=max_sim,
+            min_weight=min_weight,
+            min_shared=min_shared,
+            limit=limit,
+            sample_files=sample_files,
+            max_digest_freq=max_digest_freq or 200,
+            verbose=verbose,
+        )
+
+    # SQL Engine with properly scoped CTE
     query, base_params = build_candidate_query(sample_files=sample_files, max_digest_freq=max_digest_freq)
-    params = list(base_params) + [min_weight, min_weight]
-    if max_digest_freq and max_digest_freq > 0:
-        params.append(max_digest_freq)
-    params.extend([min_shared, min_sim, max_sim, limit])
+    if sample_files and sample_files > 0:
+        params = [sample_files, min_weight, min_shared, min_sim, max_sim, limit]
+    else:
+        params = list(base_params) + [min_weight, min_weight]
+        if max_digest_freq and max_digest_freq > 0:
+            params.append(max_digest_freq)
+        params.extend([min_shared, min_sim, max_sim, limit])
 
     with conn.cursor() as cur:
         if timeout > 0:
@@ -233,14 +430,11 @@ def fetch_candidate_pairs(
             cur.execute(f"SET statement_timeout = {int(timeout * 1000)};")
 
         if verbose:
-            print(f"[Verbose] Executing query with parameters: {params}")
+            print(f"[Verbose] Executing SQL candidate query with params: {params}")
 
-        with QueryTimer("Scanning PostgreSQL for candidate pairs"):
+        with QueryTimer("Running PostgreSQL self-join query"):
             cur.execute(query, params)
             rows = cur.fetchall()
-
-    if verbose:
-        print(f"[Verbose] Retrieved {len(rows)} matching pair record(s).")
 
     candidates: list[PairCandidate] = []
     for f1, f2, sim, shared, n1, n2, c1, c2 in rows:
@@ -263,7 +457,6 @@ def run_diagnostics(conn: Any, args: argparse.Namespace) -> None:
     """Print performance diagnosis of candidate pair matching."""
     print(f"\n{COLOR_BOLD}=== Candidate Query Performance Diagnostics ==={COLOR_RESET}")
     with conn.cursor() as cur:
-        # Check table sizes
         cur.execute("SELECT count(*) FROM telegram.file_indexed;")
         total_files = cur.fetchone()[0]
         cur.execute("SELECT count(*) FROM telegram.file_subtrees;")
@@ -275,17 +468,19 @@ def run_diagnostics(conn: Any, args: argparse.Namespace) -> None:
         print(f"Total subtree rows:      {total_subtrees:,}")
         print(f"Unique subtree digests:   {unique_digests:,}")
 
-        # Check for ubiquitous subtrees (the hub/combinatorial explosion problem)
         print(f"\n{COLOR_YELLOW}Top 10 Most Common Subtrees (weight >= {args.min_weight}):{COLOR_RESET}")
-        print(f"Subtrees appearing in hundreds of files cause O(N^2) join row explosions.")
-        cur.execute("""
+        print("Subtrees appearing in hundreds of files cause O(N^2) join explosions in SQL.")
+        cur.execute(
+            """
             SELECT digest, label, weight, count(DISTINCT file_sha) AS file_count
             FROM telegram.file_subtrees
             WHERE weight >= %s
             GROUP BY digest, label, weight
             ORDER BY file_count DESC
             LIMIT 10;
-        """, (args.min_weight,))
+            """,
+            (args.min_weight,),
+        )
         rows = cur.fetchall()
 
         print(f"{'Digest':<18} {'Label':<24} {'Weight':<8} {'Files':<8} {'Join Combinations':<18}")
@@ -296,15 +491,17 @@ def run_diagnostics(conn: Any, args: argparse.Namespace) -> None:
             total_potential_combos += combos
             print(f"{d[:16]:<18} {l[:22]:<24} {w:<8} {cnt:<8,} ~{combos:<18,}")
         print("-" * 80)
-        print(f"Just these top 10 subtrees alone generate ~{total_potential_combos:,} intermediate join rows!")
+        print(f"Just these top 10 subtrees alone generate ~{total_potential_combos:,} intermediate join rows in SQL!")
 
-        # Run EXPLAIN on the candidate query
         print(f"\n{COLOR_BOLD}PostgreSQL Query Execution Plan (EXPLAIN):{COLOR_RESET}")
         query, base_params = build_candidate_query(sample_files=args.sample_files, max_digest_freq=args.max_digest_freq)
-        params = list(base_params) + [args.min_weight, args.min_weight]
-        if args.max_digest_freq and args.max_digest_freq > 0:
-            params.append(args.max_digest_freq)
-        params.extend([args.min_shared_weight, args.min_similarity, args.max_similarity, args.limit])
+        if args.sample_files and args.sample_files > 0:
+            params = [args.sample_files, args.min_weight, args.min_shared_weight, args.min_similarity, args.max_similarity, args.limit]
+        else:
+            params = list(base_params) + [args.min_weight, args.min_weight]
+            if args.max_digest_freq and args.max_digest_freq > 0:
+                params.append(args.max_digest_freq)
+            params.extend([args.min_shared_weight, args.min_similarity, args.max_similarity, args.limit])
 
         cur.execute("EXPLAIN " + query, params)
         plan_lines = cur.fetchall()
@@ -383,17 +580,14 @@ def launch_external_diff(pair: PairCandidate, custom_diff_tool: str | None = Non
             subprocess.run([diff_prog, str(f1), str(f2)], check=False)
             return
 
-        # Try VS Code diff if 'code' is on PATH
         if shutil.which("code"):
             subprocess.run(["code", "--diff", str(f1), str(f2)], check=False)
             return
 
-        # Try Meld if installed
         if shutil.which("meld"):
             subprocess.run(["meld", str(f1), str(f2)], check=False)
             return
 
-        # Fall back to git diff --no-index
         subprocess.run(["git", "diff", "--no-index", "--color", str(f1), str(f2)], check=False)
 
 
@@ -501,7 +695,7 @@ def interactive_loop(pairs: list[PairCandidate], custom_diff_tool: str | None = 
 def handle_pairs_command(args: argparse.Namespace) -> None:
     """Handle the 'pairs' subcommand execution."""
     if args.verbose:
-        print(f"[Verbose] Connecting to PostgreSQL database...")
+        print("[Verbose] Connecting to PostgreSQL database...")
 
     try:
         with get_db_connection() as conn:
@@ -510,8 +704,7 @@ def handle_pairs_command(args: argparse.Namespace) -> None:
                 return
 
             print(
-                f"Querying candidate pairs in similarity window "
-                f"[{args.min_similarity:.4f}, {args.max_similarity:.4f}] "
+                f"Finding candidate pairs with similarity in [{args.min_similarity:.4f}, {args.max_similarity:.4f}] "
                 f"(min_weight: {args.min_weight}, min_shared: {args.min_shared_weight}, limit: {args.limit})..."
             )
             pairs = fetch_candidate_pairs(
@@ -524,23 +717,17 @@ def handle_pairs_command(args: argparse.Namespace) -> None:
                 sample_files=args.sample_files,
                 max_digest_freq=args.max_digest_freq,
                 timeout=args.timeout,
+                engine=args.engine,
                 verbose=args.verbose,
             )
     except Exception as exc:  # pylint: disable=broad-except
         err_msg = str(exc)
-        print(f"\n{COLOR_RED}Database query error: {err_msg}{COLOR_RESET}", file=sys.stderr)
+        print(f"\n{COLOR_RED}Query error: {err_msg}{COLOR_RESET}", file=sys.stderr)
         if "canceling statement due to statement timeout" in err_msg or "timeout" in err_msg:
             print(f"\n{COLOR_YELLOW}[Diagnosis & Suggested Fixes]{COLOR_RESET}")
-            print("The self-join on telegram.file_subtrees timed out. This occurs when common subtrees")
-            print("create a massive combinatorial explosion of pair comparisons across the database.")
-            print("\nRecommended solutions:")
-            print(f"  1. Use --sample-files (e.g. --sample-files 2000):")
-            print("     Restricts candidate search to a random/initial slice of files, running in seconds.")
-            print(f"  2. Increase --min-weight (e.g. --min-weight 10 or 15):")
-            print("     Filters out tiny 5-node subtrees (common 1-line statements) that cause millions of joins.")
-            print(f"  3. Increase --min-shared-weight (e.g. --min-shared-weight 50).")
-            print(f"  4. Run with --diagnose or --explain to inspect query plan and common subtrees:")
-            print("     ./inspect_db.py pairs --diagnose")
+            print("The PostgreSQL query timed out due to self-join combinatorics on common subtrees.")
+            print("Try running with the fast in-memory engine:")
+            print("  ./inspect_db.py pairs --engine memory --sample-files 2000")
         sys.exit(1)
 
     if not pairs:
@@ -648,9 +835,15 @@ def build_parser() -> argparse.ArgumentParser:
     pairs_parser.add_argument(
         "--max-digest-freq",
         type=int,
-        default=None,
+        default=200,
         metavar="N",
         help="Exclude subtrees shared across more than N files (filters out common boilerplate hub nodes)",
+    )
+    pairs_parser.add_argument(
+        "--engine",
+        choices=["auto", "memory", "sql"],
+        default="auto",
+        help="Matching engine: 'auto'/'memory' uses lightning-fast inverted index in RAM; 'sql' runs PostgreSQL self-join",
     )
     pairs_parser.add_argument(
         "--timeout",
